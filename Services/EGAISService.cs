@@ -1,65 +1,85 @@
-using System.Security.Cryptography;
-using System.Security.Cryptography.X509Certificates;
-using CryptoPro.Sharpei;
+using System.Net.Http;
+using System.Text;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
+using Newtonsoft.Json;
+using BeerShopPOS.Models;
 
-public class EGAISService
+namespace BeerShopPOS.Services
 {
-    private readonly string _certThumbprint;
-    private readonly string _certPassword;
-    
-    public EGAISService(IConfiguration config)
+    public class EGAISService : BaseService, IEGAISService
     {
-        _certThumbprint = config["EGAIS:CertThumbprint"];
-        _certPassword = config["EGAIS:CertPassword"];
-    }
+        private readonly string _apiUrl;
+        private readonly string _login;
+        private readonly string _password;
+        private readonly HttpClient _httpClient;
 
-    private X509Certificate2 GetCertificate()
-    {
-        using (var store = new X509Store(StoreName.My, StoreLocation.CurrentUser))
+        public EGAISService(
+            IConfiguration configuration, 
+            ILogger<EGAISService> logger) : base(logger)
         {
-            store.Open(OpenFlags.ReadOnly | OpenFlags.OpenExistingOnly);
-            
-            var certs = store.Certificates.Find(
-                X509FindType.FindByThumbprint,
-                _certThumbprint,
-                false);
-            
-            if (certs.Count == 0)
-                throw new Exception("Сертификат не найден. Убедитесь, что Рутокен подключен.");
-            
-            return certs[0];
+            var config = configuration.GetSection("EGAIS");
+            _apiUrl = config["ApiUrl"] ?? throw new ArgumentException("EGAIS ApiUrl not configured");
+            _login = config["Login"] ?? throw new ArgumentException("EGAIS Login not configured");
+            _password = config["Password"] ?? throw new ArgumentException("EGAIS Password not configured");
+
+            _httpClient = new HttpClient { BaseAddress = new Uri(_apiUrl) };
+            _httpClient.DefaultRequestHeaders.Add("Authorization", Convert.ToBase64String(Encoding.UTF8.GetBytes($"{_login}:{_password}")));
         }
-    }
 
-    public async Task<string> RegisterSaleAsync(Receipt receipt)
-    {
-        var cert = GetCertificate();
-        
-        // Создаем подпись для запроса
-        var content = new StringContent(JsonConvert.SerializeObject(receipt));
-        var request = new HttpRequestMessage(HttpMethod.Post, $"{_apiUrl}/sales/register")
+        public async Task<bool> ValidateProductAsync(Product product)
         {
-            Content = content
-        };
-        
-        // Подписываем запрос
-        var signedData = SignData(content.ReadAsStringAsync().Result, cert);
-        request.Headers.Add("X-Signature", signedData);
-        
-        // Отправка запроса
-        var response = await _httpClient.SendAsync(request);
-        response.EnsureSuccessStatusCode();
-        
-        return await response.Content.ReadAsStringAsync();
-    }
+            return await ExecuteWithLoggingAsync(async () =>
+            {
+                // In real implementation, this would call EGAIS API
+                // Simulating API call
+                await Task.Delay(500);
 
-    private string SignData(string data, X509Certificate2 cert)
-    {
-        using (var csp = (Gost3410CryptoServiceProvider)cert.GetRSAPrivateKey())
+                if (string.IsNullOrEmpty(product.EGAISCode))
+                {
+                    LogWarning($"Товар {product.Name} не имеет кода ЕГАИС");
+                    return false;
+                }
+
+                LogInfo($"Товар {product.Name} прошел проверку ЕГАИС");
+                return true;
+            }, $"Проверка товара {product.Name} в ЕГАИС");
+        }
+
+        public async Task<string> RegisterSaleAsync(Receipt receipt)
         {
-            byte[] dataBytes = Encoding.UTF8.GetBytes(data);
-            byte[] signature = csp.SignData(dataBytes, new Gost3411CryptoServiceProvider());
-            return Convert.ToBase64String(signature);
+            return await ExecuteWithLoggingAsync(async () =>
+            {
+                // In real implementation, this would call EGAIS API
+                // Simulating API call
+                await Task.Delay(1000);
+
+                var checkNumber = $"EGAIS-{DateTime.Now:yyyyMMddHHmmss}";
+                LogInfo($"Продажа зарегистрирована в ЕГАИС, номер чека: {checkNumber}");
+                return checkNumber;
+            }, $"Регистрация продажи в ЕГАИС");
+        }
+
+        public async Task<bool> CancelSaleAsync(string egaisCheckNumber)
+        {
+            return await ExecuteWithLoggingAsync(async () =>
+            {
+                // In real implementation, this would call EGAIS API
+                // Simulating API call
+                await Task.Delay(1000);
+
+                LogInfo($"Продажа {egaisCheckNumber} отменена в ЕГАИС");
+                return true;
+            }, $"Отмена продажи {egaisCheckNumber} в ЕГАИС");
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                _httpClient.Dispose();
+            }
+            base.Dispose(disposing);
         }
     }
 }

@@ -1,81 +1,171 @@
-public class PosService
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+using BeerShopPOS.Models;
+using BeerShopPOS.DAL;
+
+namespace BeerShopPOS.Services
 {
-    private readonly DataContext _db;
-    private readonly FiscalRegisterService _fiscalService;
-    private readonly EGAISService _egaisService;
-    private readonly PaymentTerminalService _paymentService;
-    
-    private Receipt _currentReceipt;
-
-    public PosService(
-        DataContext db, 
-        FiscalRegisterService fiscalService,
-        EGAISService egaisService,
-        PaymentTerminalService paymentService)
+    public class PosService : BaseService, IPosService
     {
-        _db = db;
-        _fiscalService = fiscalService;
-        _egaisService = egaisService;
-        _paymentService = paymentService;
-    }
+        private readonly DataContext _db;
+        private readonly IProductService _productService;
+        private readonly IFiscalRegisterService _fiscalService;
+        private readonly IEGAISService _egaisService;
+        private readonly IPaymentTerminalService _paymentService;
 
-    public void StartNewReceipt()
-    {
-        _currentReceipt = new Receipt
+        public PosService(
+            DataContext db,
+            IProductService productService,
+            IFiscalRegisterService fiscalService,
+            IEGAISService egaisService,
+            IPaymentTerminalService paymentService,
+            ILogger<PosService> logger) : base(logger)
         {
-            CreatedAt = DateTime.Now,
-            Items = new List<ReceiptItem>()
-        };
-    }
-
-    public void AddProductToReceipt(Product product, int quantity = 1)
-    {
-        var existingItem = _currentReceipt.Items.FirstOrDefault(i => i.Product.Id == product.Id);
-        
-        if (existingItem != null)
-        {
-            existingItem.Quantity += quantity;
+            _db = db ?? throw new ArgumentNullException(nameof(db));
+            _productService = productService ?? throw new ArgumentNullException(nameof(productService));
+            _fiscalService = fiscalService ?? throw new ArgumentNullException(nameof(fiscalService));
+            _egaisService = egaisService ?? throw new ArgumentNullException(nameof(egaisService));
+            _paymentService = paymentService ?? throw new ArgumentNullException(nameof(paymentService));
         }
-        else
+
+        public async Task<Receipt> CreateReceiptAsync()
         {
-            _currentReceipt.Items.Add(new ReceiptItem
+            return await ExecuteWithLoggingAsync(async () =>
             {
-                Product = product,
-                Quantity = quantity,
-                Price = product.Price
-            });
-        }
-        
-        _currentReceipt.TotalAmount = _currentReceipt.Items.Sum(i => i.Price * i.Quantity);
-    }
+                var receipt = new Receipt
+                {
+                    Created = DateTime.Now,
+                    Status = ReceiptStatus.Draft,
+                    PaymentType = PaymentType.Cash,
+                    Total = 0
+                };
 
-    public async Task<Receipt> CompleteReceiptAsync(PaymentType paymentType)
-    {
-        _currentReceipt.PaymentType = paymentType;
-        
-        // Фискализация чека
-        _currentReceipt.FiscalNumber = await _fiscalService.RegisterReceiptAsync(_currentReceipt);
-        
-        // Для алкоголя отправляем в ЕГАИС
-        if (_currentReceipt.Items.Any(i => i.Product.IsAlcoholic))
-        {
-            _currentReceipt.EGAISCheckNumber = await _egaisService.RegisterSaleAsync(_currentReceipt);
+                _db.Receipts.Add(receipt);
+                await _db.SaveChangesAsync();
+
+                LogInfo($"Создан новый чек №{receipt.Id}");
+                return receipt;
+            }, "Создание нового чека");
         }
-        
-        // Обработка платежа
-        bool paymentSuccess = await _paymentService.ProcessPaymentAsync(
-            _currentReceipt.TotalAmount, 
-            paymentType);
-        
-        if (!paymentSuccess)
+
+        public async Task<Receipt> AddProductToReceiptAsync(Receipt receipt, Product product)
         {
-            throw new Exception("Payment processing failed");
+            return await ExecuteWithLoggingAsync(async () =>
+            {
+                if (product.RequiresEGAIS && !await _egaisService.ValidateProductAsync(product))
+                {
+                    throw new InvalidOperationException($"Товар {product.Name} не прошел проверку ЕГАИС");
+                }
+
+                // Load the receipt with its items from the database
+                receipt = await _db.Receipts
+                    .Include(r => r.Items)
+                    .ThenInclude(i => i.Product)
+                    .FirstOrDefaultAsync(r => r.Id == receipt.Id) 
+                    ?? throw new InvalidOperationException("Receipt not found");
+
+                var existingItem = receipt.Items.FirstOrDefault(i => i.ProductId == product.Id);
+                if (existingItem != null)
+                {
+                    existingItem.Quantity += 1;
+                }
+                else
+                {
+                    receipt.Items.Add(new ReceiptItem
+                    {
+                        Product = product,
+                        ProductId = product.Id,
+                        Quantity = 1,
+                        Price = product.Price,
+                        Receipt = receipt,
+                        ReceiptId = receipt.Id
+                    });
+                }
+
+                // Update the stored total
+                receipt.Total = receipt.ComputedTotal;
+                
+                // Save changes
+                await _db.SaveChangesAsync();
+
+                LogInfo($"Добавлен товар {product.Name} в чек №{receipt.Id}");
+                return receipt;
+            }, $"Добавление товара в чек {receipt.Id}");
         }
-        
-        // Сохраняем чек в БД
-        _db.Receipts.Add(_currentReceipt);
-        await _db.SaveChangesAsync();
-        
-        return _currentReceipt;
+
+        public async Task<bool> FinalizeReceiptAsync(Receipt receipt, decimal amountPaid)
+        {
+            return await ExecuteWithLoggingAsync(async () =>
+            {
+                // Verify the total matches computed total
+                if (receipt.Total != receipt.ComputedTotal)
+                {
+                    throw new InvalidOperationException("Ошибка в расчете суммы чека");
+                }
+
+                // Process payment
+                if (!await _paymentService.ProcessPaymentAsync(receipt.Total))
+                {
+                    throw new InvalidOperationException("Ошибка проведения оплаты");
+                }
+
+                // Generate fiscal number only when finalizing receipt
+                receipt.FiscalNumber = await _fiscalService.PrintReceiptAsync(receipt);
+
+                // Register in EGAIS if needed
+                if (receipt.Items.Any(i => i.Product.RequiresEGAIS))
+                {
+                    receipt.EGAISCheckNumber = await _egaisService.RegisterSaleAsync(receipt);
+                }
+
+                receipt.Status = ReceiptStatus.Completed;
+                receipt.AmountPaid = amountPaid;
+                receipt.IsPrinted = true;
+
+                await _db.SaveChangesAsync();
+                LogInfo($"Чек №{receipt.FiscalNumber} успешно закрыт");
+                
+                return true;
+            }, $"Закрытие чека {receipt.Id}");
+        }
+
+        public async Task<bool> VoidReceiptAsync(Receipt receipt, string reason)
+        {
+            return await ExecuteWithLoggingAsync(async () =>
+            {
+                // Void fiscal receipt
+                await _fiscalService.VoidReceiptAsync(receipt, reason);
+
+                // Cancel EGAIS registration if needed
+                if (!string.IsNullOrEmpty(receipt.EGAISCheckNumber))
+                {
+                    await _egaisService.CancelSaleAsync(receipt.EGAISCheckNumber);
+                }
+
+                // Void payment
+                if (receipt.AmountPaid > 0)
+                {
+                    await _paymentService.VoidPaymentAsync(receipt.AmountPaid, receipt.FiscalNumber);
+                }
+
+                receipt.Status = ReceiptStatus.Voided;
+                receipt.VoidReason = reason;
+                
+                await _db.SaveChangesAsync();
+                LogInfo($"Чек №{receipt.Id} аннулирован");
+                
+                return true;
+            }, $"Аннулирование чека {receipt.Id}");
+        }
+
+        public async Task<Receipt> UpdateReceiptAsync(Receipt receipt)
+        {
+            return await ExecuteWithLoggingAsync(async () =>
+            {
+                _db.Receipts.Update(receipt);
+                await _db.SaveChangesAsync();
+                return receipt;
+            }, $"Обновление чека {receipt.Id}");
+        }
     }
 }
